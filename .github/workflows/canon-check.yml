@@ -1,0 +1,87 @@
+name: canon-check
+
+# Pattern Blue canon is append-only.
+# This workflow rejects any PR that mutates existing content in canon/.
+# New files may be added. Existing files may grow (lines appended at the end).
+# Any edit that removes a line, reorders lines, or modifies the middle of a
+# canonical file fails this check.
+#
+# Typos in canon may be fixed in a PR titled `typo:` — reviewers are expected
+# to audit those manually; CI will still flag them, and that is the intended
+# signal.
+
+on:
+  pull_request:
+    paths:
+      - 'canon/**'
+
+jobs:
+  enforce-append-only:
+    name: Enforce canon append-only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine base
+        id: base
+        run: |
+          echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check each changed canon file
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.base.outputs.base_sha }}"
+
+          # List changed paths under canon/
+          mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD -- 'canon/**' || true)
+
+          if [[ ${#CHANGED[@]} -eq 0 ]]; then
+            echo "No canon changes. OK."
+            exit 0
+          fi
+
+          fail=0
+          for f in "${CHANGED[@]}"; do
+            # If the file didn't exist on base, it's a new file — allowed.
+            if ! git cat-file -e "$BASE:$f" 2>/dev/null; then
+              echo "::notice file=$f::new canonical file added — allowed"
+              continue
+            fi
+
+            # Extract old and new contents
+            git show "$BASE:$f" > /tmp/old_canon
+            cp "$f" /tmp/new_canon
+
+            old_lines=$(wc -l < /tmp/old_canon)
+            new_lines=$(wc -l < /tmp/new_canon)
+
+            # New file must be at least as long as old
+            if [[ "$new_lines" -lt "$old_lines" ]]; then
+              echo "::error file=$f::canon file shrank ($old_lines -> $new_lines lines). canon is append-only."
+              fail=1
+              continue
+            fi
+
+            # The first N lines of the new file must match the old file exactly
+            head -n "$old_lines" /tmp/new_canon > /tmp/new_prefix
+            if ! diff -q /tmp/old_canon /tmp/new_prefix > /dev/null; then
+              echo "::error file=$f::canon file mutated (prefix does not match). canon is append-only; only trailing additions are permitted."
+              diff /tmp/old_canon /tmp/new_prefix | head -40 || true
+              fail=1
+              continue
+            fi
+
+            echo "::notice file=$f::canon file extended cleanly ($old_lines -> $new_lines lines)"
+          done
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo ""
+            echo "One or more canon files were mutated. Pattern Blue canon is append-only."
+            echo "If you believe a correction is genuinely needed, open a discussion first."
+            exit 1
+          fi
+
+          echo "All canon changes are append-only. OK."
